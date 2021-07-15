@@ -1,8 +1,10 @@
 import type { Renderer, AstroComponentMetadata } from '../@types/astro';
+
 import hash from 'shorthash';
 import { valueToEstree, Value } from 'estree-util-value-to-estree';
 import { generate } from 'astring';
 import * as astroHtml from './renderer-html';
+import { ASTRO_FRONTEND } from '../runtime/internal';
 
 // A more robust version alternative to `JSON.stringify` that can handle most values
 // see https://github.com/remcohaszing/estree-util-value-to-estree#readme
@@ -22,11 +24,7 @@ const astroHtmlRendererInstance: RendererInstance = {
   hydrationPolyfills: [],
 };
 
-let rendererInstances: RendererInstance[] = [];
-
-export function setRenderers(_rendererInstances: RendererInstance[]) {
-  rendererInstances = ([] as RendererInstance[]).concat(_rendererInstances);
-}
+declare let rendererInstances: RendererInstance[];
 
 function isCustomElementTag(name: string | Function) {
   return typeof name === 'string' && /-/.test(name);
@@ -93,7 +91,7 @@ async function generateHydrateScript(scriptOptions: HydrateScriptOptions, metada
 `;
 
   const hydrationScript = `<script type="module">
-import setup from '/_astro_frontend/hydrate/${hydrate}.js';
+import setup from '${ASTRO_FRONTEND}hydrate/${hydrate}.js';
 setup("${astroId}", {${metadata.value ? `value: "${metadata.value}"` : ''}}, async () => {
   ${hydrationSource}
 });

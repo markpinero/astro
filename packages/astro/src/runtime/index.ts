@@ -1,86 +1,60 @@
-import type { LogOptions } from './logger';
-import type { AstroConfig, CollectionResult, CollectionRSS, CreateCollection, Params, RuntimeMode } from './@types/astro';
-import type { CompileError as ICompileError } from '@astrojs/parser';
+import type { AstroConfig, CollectionResult, CollectionRSS, CreateCollection, Params } from '../@types/astro';
+import type { CompileOptions } from '../@types/compiler';
+import type { AstroRuntime, LoadResult, RuntimeConfig, RuntimeOptions } from '../@types/runtime';
 
-import resolve from 'resolve';
+import { CompileError } from '@astrojs/parser';
 import { existsSync, promises as fs } from 'fs';
 import { fileURLToPath } from 'url';
+import mime from 'mime';
 import { posix as path } from 'path';
 import { performance } from 'perf_hooks';
-import {
-  loadConfiguration,
-  logger as snowpackLogger,
-  NotFoundError,
-  SnowpackDevServer,
-  ServerRuntime as SnowpackServerRuntime,
-  SnowpackConfig,
-  startServer as startSnowpackServer,
-} from 'snowpack';
-import parser from '@astrojs/parser';
-const { CompileError } = parser;
-import { canonicalURL, getSrcPath, stopTimer } from './build/util.js';
-import { debug, info } from './logger.js';
-import { configureSnowpackLogger } from './snowpack-logger.js';
+import { createServer as createViteServer } from 'vite';
+import { canonicalURL, getSrcPath, stopTimer } from '../build/util.js';
+import { debug, info } from '../logger.js';
+import { NotFoundError } from './error.js';
+import { ASTRO_FRONTEND, loadInternalFile } from './internal.js';
+import { CJS_EXTERNALS, ESM_EXTERNALS } from './modules.js';
 import { searchForPage } from './search.js';
-import snowpackExternals from './external.js';
-import { nodeBuiltinsMap } from './node_builtins.js';
-import { ConfigManager } from './config_manager.js';
+import { createStaticServer, loadStaticFile } from './static.js';
+import astro from './vite_plugin.js';
 
-interface RuntimeConfig {
-  astroConfig: AstroConfig;
-  logging: LogOptions;
-  mode: RuntimeMode;
-  snowpack: SnowpackDevServer;
-  snowpackRuntime: SnowpackServerRuntime;
-  snowpackConfig: SnowpackConfig;
-  configManager: ConfigManager;
-}
-
-// info needed for collection generation
-interface CollectionInfo {
-  additionalURLs: Set<string>;
-  rss?: { data: any[] & CollectionRSS };
-}
-
-type LoadResultSuccess = {
-  statusCode: 200;
-  contents: string | Buffer;
-  contentType?: string | false;
-};
-type LoadResultNotFound = { statusCode: 404; error: Error; collectionInfo?: CollectionInfo };
-type LoadResultRedirect = { statusCode: 301 | 302; location: string; collectionInfo?: CollectionInfo };
-type LoadResultError = { statusCode: 500 } & (
-  | { type: 'parse-error'; error: ICompileError }
-  | { type: 'ssr'; error: Error }
-  | { type: 'not-found'; error: ICompileError }
-  | { type: 'unknown'; error: Error }
-);
-
-export type LoadResult = (LoadResultSuccess | LoadResultNotFound | LoadResultRedirect | LoadResultError) & { collectionInfo?: CollectionInfo };
-
-// Disable snowpack from writing to stdout/err.
-configureSnowpackLogger(snowpackLogger);
-
+// info needed for collection generatio
 /** Pass a URL to Astro to resolve and build */
 async function load(config: RuntimeConfig, rawPathname: string | undefined): Promise<LoadResult> {
-  const { logging, snowpackRuntime, snowpack, configManager } = config;
+  const { logging, staticServer, viteServer } = config;
   const { buildOptions, devOptions } = config.astroConfig;
 
   let origin = buildOptions.site ? new URL(buildOptions.site).origin : `http://localhost:${devOptions.port}`;
   const fullurl = new URL(rawPathname || '/', origin);
 
-  const reqPath = decodeURI(fullurl.pathname);
+  let reqPath = decodeURI(fullurl.pathname);
+  if (reqPath.endsWith('/')) reqPath += 'index.html';
   info(logging, 'access', reqPath);
 
+  // static files
+  try {
+    const result = await loadStaticFile(reqPath, { server: staticServer });
+    if (result.statusCode === 200) return result;
+  } catch (err) {
+    // don’t throw yet; attempt other lookups before returning 404
+  }
+
+  // Astro internal
+  if (reqPath.startsWith(ASTRO_FRONTEND)) {
+    return await loadInternalFile(reqPath);
+  }
+
+  // Astro pages
   const searchResult = searchForPage(fullurl, config.astroConfig);
   if (searchResult.statusCode === 404) {
     try {
-      const result = await snowpack.loadUrl(reqPath);
+      const result = await viteServer.transformRequest(reqPath);
       if (!result) throw new Error(`Unable to load ${reqPath}`);
       // success
       return {
         statusCode: 200,
-        ...result,
+        contents: typeof result === 'string' ? result : `${result.code}`,
+        contentType: mime.getType(reqPath) || 'text/plain',
       };
     } catch (err) {
       // build error
@@ -97,22 +71,18 @@ async function load(config: RuntimeConfig, rawPathname: string | undefined): Pro
     return { statusCode: 301, location: searchResult.pathname };
   }
 
-  const snowpackURL = searchResult.location.snowpackURL;
   let rss: { data: any[] & CollectionRSS } = {} as any;
 
+  // other resources
   try {
-    if (configManager.needsUpdate()) {
-      await configManager.update();
-    }
-    const mod = await snowpackRuntime.importModule(snowpackURL);
-    debug(logging, 'resolve', `${reqPath} -> ${snowpackURL}`);
+    const mod = await viteServer.ssrLoadModule(fileURLToPath(searchResult.location));
 
     // handle collection
     let collection = {} as CollectionResult;
     let additionalURLs = new Set<string>();
 
-    if (mod.exports.createCollection) {
-      const createCollection: CreateCollection = await mod.exports.createCollection();
+    if (mod.createCollection) {
+      const createCollection: CreateCollection = await mod.createCollection();
       const VALID_KEYS = new Set(['data', 'routes', 'permalink', 'pageSize', 'rss']);
       for (const key of Object.keys(createCollection)) {
         if (!VALID_KEYS.has(key)) {
@@ -227,7 +197,7 @@ async function load(config: RuntimeConfig, rawPathname: string | undefined): Pro
       requestURL.search = '';
     }
 
-    let html = (await mod.exports.__renderPage({
+    let html = await mod.__renderPage({
       request: {
         // params should go here when implemented
         url: requestURL,
@@ -236,7 +206,7 @@ async function load(config: RuntimeConfig, rawPathname: string | undefined): Pro
       children: [],
       props: Object.keys(collection).length > 0 ? { collection } : {},
       css: Array.isArray(mod.css) ? mod.css : typeof mod.css === 'string' ? [mod.css] : [],
-    })) as string;
+    });
 
     return {
       statusCode: 200,
@@ -309,171 +279,53 @@ async function load(config: RuntimeConfig, rawPathname: string | undefined): Pro
     };
   }
 }
-
-export interface AstroRuntime {
-  runtimeConfig: RuntimeConfig;
-  load: (rawPathname: string | undefined) => Promise<LoadResult>;
-  shutdown: () => Promise<void>;
-}
-
-export interface RuntimeOptions {
-  mode: RuntimeMode;
-  logging: LogOptions;
-}
-
-interface CreateSnowpackOptions {
-  mode: RuntimeMode;
-  resolvePackageUrl: (pkgName: string) => Promise<string>;
-}
-
-/** Create a new Snowpack instance to power Astro */
-async function createSnowpack(astroConfig: AstroConfig, options: CreateSnowpackOptions) {
-  const { projectRoot, src } = astroConfig;
-  const { mode, resolvePackageUrl } = options;
-
-  const frontendPath = new URL('./frontend/', import.meta.url);
-  const resolveDependency = (dep: string) => resolve.sync(dep, { basedir: fileURLToPath(projectRoot) });
-  const isHmrEnabled = mode === 'development';
-
-  // The config manager takes care of the runtime config module (that handles setting renderers, mostly)
-  const configManager = new ConfigManager(astroConfig, resolvePackageUrl);
-
-  let snowpack: SnowpackDevServer;
-  let astroPluginOptions: {
-    resolvePackageUrl?: (s: string) => Promise<string>;
-    astroConfig: AstroConfig;
-    hmrPort?: number;
-    mode: RuntimeMode;
-    configManager: ConfigManager;
-  } = {
-    astroConfig,
-    mode,
-    resolvePackageUrl,
-    configManager,
-  };
-
-  const mountOptions = {
-    ...(existsSync(astroConfig.public) ? { [fileURLToPath(astroConfig.public)]: '/' } : {}),
-    [fileURLToPath(frontendPath)]: '/_astro_frontend',
-    [fileURLToPath(src)]: '/_astro/src', // must be last (greediest)
-  };
-
+/** Create a new Vite instance to power Astro */
+async function createVite(astroConfig: AstroConfig, compileOptions: CompileOptions) {
   // Tailwind: IDK what this does but it makes JIT work 🤷‍♂️
   if (astroConfig.devOptions.tailwindConfig) {
     (process.env as any).TAILWIND_DISABLE_TOUCH = true;
   }
 
-  // Make sure that Snowpack builds our renderer plugins
-  const rendererInstances = await configManager.buildRendererInstances();
-  const knownEntrypoints: string[] = ['astro/dist/internal/__astro_component.js', 'astro/dist/internal/element-registry.js'];
-  for (const renderer of rendererInstances) {
-    knownEntrypoints.push(renderer.server);
-    if (renderer.client) {
-      knownEntrypoints.push(renderer.client);
-    }
-    if (renderer.knownEntrypoints) {
-      knownEntrypoints.push(...renderer.knownEntrypoints);
-    }
-    knownEntrypoints.push(...renderer.polyfills);
-    knownEntrypoints.push(...renderer.hydrationPolyfills);
-  }
-  const external = snowpackExternals.concat([]);
-  for (const renderer of rendererInstances) {
-    if (renderer.external) {
-      external.push(...renderer.external);
-    }
-  }
-  const rendererSnowpackPlugins = rendererInstances.filter((renderer) => renderer.snowpackPlugin).map((renderer) => renderer.snowpackPlugin) as string | [string, any];
-
-  const snowpackConfig = await loadConfiguration({
-    root: fileURLToPath(projectRoot),
-    mount: mountOptions,
-    mode,
-    plugins: [
-      [fileURLToPath(new URL('../snowpack-plugin.cjs', import.meta.url)), astroPluginOptions],
-      ...rendererSnowpackPlugins,
-      resolveDependency('@snowpack/plugin-sass'),
-      [
-        resolveDependency('@snowpack/plugin-postcss'),
-        {
-          config: {
-            plugins: {
-              [resolveDependency('autoprefixer')]: {},
-              ...(astroConfig.devOptions.tailwindConfig ? { [resolveDependency('tailwindcss')]: astroConfig.devOptions.tailwindConfig } : {}),
-            },
-          },
-        },
-      ],
-    ],
-    devOptions: {
-      open: 'none',
-      output: 'stream',
-      port: 0,
-      hmr: isHmrEnabled,
-      tailwindConfig: astroConfig.devOptions.tailwindConfig,
+  return createViteServer({
+    root: fileURLToPath(astroConfig.projectRoot),
+    logLevel: 'error',
+    mode: compileOptions.mode,
+    ssr: {
+      external: [...CJS_EXTERNALS],
+      noExternal: [...ESM_EXTERNALS],
     },
-    buildOptions: {
-      baseUrl: astroConfig.buildOptions.site || '/', // note: Snowpack needs this fallback
-      out: astroConfig.dist,
-    },
-    packageOptions: {
-      knownEntrypoints,
-      external,
-    },
-  });
-
-  const polyfillNode = (snowpackConfig.packageOptions as any).polyfillNode as boolean;
-  if (!polyfillNode) {
-    snowpackConfig.alias = Object.assign({}, Object.fromEntries(nodeBuiltinsMap), snowpackConfig.alias ?? {});
-  }
-
-  snowpack = await startSnowpackServer(
-    {
-      config: snowpackConfig,
-      lockfile: null,
-    },
-    {
-      isWatch: mode === 'development',
-    }
-  );
-  const snowpackRuntime = snowpack.getServerRuntime();
-  astroPluginOptions.configManager.snowpackRuntime = snowpackRuntime;
-
-  return { snowpack, snowpackRuntime, snowpackConfig, configManager };
+    plugins: [astro(compileOptions)],
+  } as any);
 }
 
 /** Core Astro runtime */
 export async function createRuntime(astroConfig: AstroConfig, { mode, logging }: RuntimeOptions): Promise<AstroRuntime> {
-  let snowpack: SnowpackDevServer;
   const timer: Record<string, number> = {};
-  const resolvePackageUrl = async (pkgName: string) => snowpack.getUrlForPackage(pkgName);
 
   timer.backend = performance.now();
-  const {
-    snowpack: snowpackInstance,
-    snowpackRuntime,
-    snowpackConfig,
-    configManager,
-  } = await createSnowpack(astroConfig, {
-    mode,
-    resolvePackageUrl,
-  });
-  snowpack = snowpackInstance;
+  const [viteServer, staticServer] = await Promise.all([
+    createVite(astroConfig, {
+      astroConfig,
+      logging,
+      mode,
+    }),
+    createStaticServer(astroConfig),
+  ]);
   debug(logging, 'core', `snowpack created [${stopTimer(timer.backend)}]`);
 
   const runtimeConfig: RuntimeConfig = {
     astroConfig,
     logging,
     mode,
-    snowpack,
-    snowpackRuntime,
-    snowpackConfig,
-    configManager,
+    viteServer,
+    staticServer,
   };
 
   return {
     runtimeConfig,
     load: load.bind(null, runtimeConfig),
-    shutdown: () => snowpack.shutdown(),
+    async shutdown() {
+      staticServer.stop();
+    },
   };
 }
