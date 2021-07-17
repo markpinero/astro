@@ -34,7 +34,15 @@
     "astro-vscode": "0.5.0",
     "www": "1.1.0",
     "@example/framework-lit": "0.0.1",
-    "@astrojs/renderer-lit": "0.1.0"
+    "@astrojs/renderer-lit": "0.1.0",
+    "docs": "0.0.2"
   },
-  "changesets": ["fair-flowers-sleep", "lemon-jars-poke", "tender-paws-smash", "wicked-gifts-cover"]
+  "changesets": [
+    "empty-otters-smell",
+    "fair-flowers-sleep",
+    "lemon-jars-poke",
+    "strange-kids-sing",
+    "tender-paws-smash",
+    "wicked-gifts-cover"
+  ]
 }

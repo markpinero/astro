@@ -1,5 +1,12 @@
 # astro
 
+## 0.18.0-next.2
+
+### Patch Changes
+
+- fb8bf7e: Allow multiple Astro servers to be running simultaneously by choosing random ports if the defaults are taken.
+- 007c220: Remove custom Astro.fetchContent() glob implementation, use `import.meta.globEager` internally instead.
+
 ## 0.18.0-next.1
 
 ### Patch Changes
