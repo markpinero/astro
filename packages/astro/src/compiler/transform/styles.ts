@@ -186,9 +186,10 @@ function injectScopedClassAttribute(node: TemplateNode, scopedClass: string, att
 
 /** Transform <style> tags */
 export default function transformStyles({ compileOptions, filename, fileID }: TransformOptions): Transformer {
+  const { cssPrefix = 'astro' } = compileOptions.astroConfig.buildOptions
   const styleNodes: TemplateNode[] = []; // <style> tags to be updated
   const styleTransformPromises: Promise<StyleTransformResult>[] = []; // async style transform results to be finished in finalize();
-  const scopedClass = `astro-${hashFromFilename(fileID)}`; // this *should* generate same hash from fileID every time
+  const scopedClass = `${cssPrefix}-${hashFromFilename(fileID)}`; // this *should* generate same hash from fileID every time
   const nodesToScope = new Set<TemplateNode>();
 
   return {

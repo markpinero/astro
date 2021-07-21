@@ -22,6 +22,8 @@ export interface AstroConfig {
   markdownOptions?: Partial<AstroMarkdownOptions>;
   /** Options specific to `astro build` */
   buildOptions: {
+    /** Changes the prefix on your CSS classes */
+    cssPrefix?: string;
     /** Your public domain, e.g.: https://my-site.dev/. Used to generate sitemaps and canonical URLs. */
     site?: string;
     /** Generate sitemap (set to "false" to disable) */
